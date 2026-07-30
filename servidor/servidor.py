@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Servidor WebSocket de supervisio.
+Servidor WebSocket de supervisio (versio amb Threads, sense asyncio).
 Espera missatges dels clients (la seva propia IP), manté un registre
 dels que s'han connectat en els darrers 60 segons i mostra per
 terminal una llista ordenada. Nomes respon als clients presents a
 ALLOWED_CLIENTS.
 """
-import asyncio
 import argparse
+import threading
+import time
 from datetime import datetime, timedelta
 
-import websockets
+from websockets.sync.server import serve
+from websockets.exceptions import ConnectionClosed
 
 DEFAULT_SERVER_IP = "1.2.3.4"
 DEFAULT_SERVER_PORT = 8765
@@ -25,55 +27,52 @@ ALLOWED_CLIENTS = [
 ]
 
 clients_seen: dict[str, datetime] = {}   # ip -> darrer contacte
-lock = asyncio.Lock()
+lock = threading.Lock()
 
 
-async def handler(websocket):
+def handler(websocket):
     origin_ip = websocket.remote_address[0]
-
     if origin_ip not in ALLOWED_CLIENTS:
         return  # ni tan sols cal llegir el missatge
 
     try:
-        async for message in websocket:
+        for message in websocket:
             client_ip = message.strip()
-
             if client_ip != origin_ip:
                 print(f"AVÍS: IP declarada ({client_ip}) no coincideix "
                       f"amb IP d'origen ({origin_ip}), descartat")
                 continue
-
-            async with lock:
+            with lock:
                 clients_seen[origin_ip] = datetime.now()
-
-            await websocket.send("OK")
-    except websockets.exceptions.ConnectionClosed:
+            websocket.send("OK")
+    except ConnectionClosed:
         pass
 
 
-
-async def print_status_loop():
+def print_status_loop():
     while True:
-        await asyncio.sleep(STATUS_INTERVAL)
+        time.sleep(STATUS_INTERVAL)
         now = datetime.now()
-        async with lock:
+        with lock:
             actius = sorted(
                 ip for ip, ts in clients_seen.items()
                 if now - ts <= timedelta(seconds=TIMEOUT_WINDOW)
             )
             ultims = dict(clients_seen)
-
         print(f"\n[{now:%H:%M:%S}] Clients actius (<{TIMEOUT_WINDOW}s): {len(actius)}")
         for ip in actius:
             antiguitat = (now - ultims[ip]).seconds
             print(f"  - {ip}  (fa {antiguitat}s)")
 
 
-async def main(host: str, port: int):
+def main(host: str, port: int):
     print(f"Servidor escoltant a ws://{host}:{port}")
     print(f"Clients permesos: {', '.join(ALLOWED_CLIENTS)}")
-    async with websockets.serve(handler, host, port):
-        await print_status_loop()
+
+    threading.Thread(target=print_status_loop, daemon=True).start()
+
+    with serve(handler, host, port) as server:
+        server.serve_forever()
 
 
 if __name__ == "__main__":
@@ -82,7 +81,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT, help="Port")
     args = parser.parse_args()
 
-try:
-    asyncio.run(main(args.ip, args.port))
-except KeyboardInterrupt:
-    print("\nClient aturat (CTRL+C)")
+    try:
+        main(args.ip, args.port)
+    except KeyboardInterrupt:
+        print("\nServidor aturat (CTRL+C)")
