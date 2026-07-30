@@ -7,6 +7,7 @@ terminal una llista ordenada. Nomes respon als clients presents a
 ALLOWED_CLIENTS.
 """
 import argparse
+import json
 import threading
 import time
 from datetime import datetime, timedelta
@@ -44,7 +45,9 @@ def handler(websocket):
                 continue
             with lock:
                 clients_seen[origin_ip] = datetime.now()
-            websocket.send("OK")
+            response = json.dumps({"client": origin_ip, "status": "OK"})
+            websocket.send(response)
+
     except ConnectionClosed:
         pass
 
