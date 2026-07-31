@@ -1,23 +1,54 @@
 #!/usr/bin/env python3
 """
-Client WebSocket de supervisio.
+Client WebSocket de supervisio (versio amb Threads, sense asyncio).
 Envia periodicament la propia IP al servidor i n'espera confirmacio.
 """
-import asyncio
 import argparse
+import json
+import queue
 import re
 import socket
 import subprocess
 import sys
+import threading
+import time
 
-import websockets
+from websockets.sync.client import connect
+from websockets.exceptions import ConnectionClosed
+import websockets.exceptions
 
 DEFAULT_SERVER_IP = "1.2.3.4"
 DEFAULT_SERVER_PORT = 8765
 CLIENT_PORT = 8766      # port local del client (bind d'origen)
-CONFIRM_TIMEOUT = 3    # segons d'espera per la confirmacio
+CONFIRM_TIMEOUT = 3     # segons d'espera per la confirmacio
 RETRY_INTERVAL = 20     # segons entre enviaments
 IFACE = "enp2s0"        # interficie de xarxa a consultar
+STATUS_READ_INTERVAL = 30  # segons entre lectures de la cua
+
+class StatusQueue:
+    """Cua FIFO thread-safe on es guarden els 'data' JSON rebuts del servidor."""
+
+    def __init__(self):
+        self._q = queue.Queue()
+
+    def put(self, item: dict) -> None:
+        self._q.put(item)
+
+    def get(self, block: bool = True, timeout: float | None = None) -> dict:
+        return self._q.get(block=block, timeout=timeout)
+
+    def empty(self) -> bool:
+        return self._q.empty()
+
+def status_reader_loop(status_queue: StatusQueue):
+    """Thread que, cada STATUS_READ_INTERVAL segons, treu un element de la cua i n'imprimeix el status."""
+    while True:
+        time.sleep(STATUS_READ_INTERVAL)
+        try:
+            data = status_queue.get(block=False)
+            print(f"[status_reader] status={data['status']}")
+        except queue.Empty:
+            print("[status_reader] cua buida")
 
 
 def detect_own_ip(iface: str = IFACE) -> str:
@@ -29,33 +60,36 @@ def detect_own_ip(iface: str = IFACE) -> str:
         ).stdout
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         sys.exit(f"No s'ha pogut consultar la interficie {iface}: {e}")
-
     match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", sortida)
     if not match:
         sys.exit(f"La interficie {iface} no té IPv4 assignada")
-
     return match.group(1)
 
+def _connected_socket(server_ip: str, server_port: int, local_addr: tuple[str, int]) -> socket.socket:
+    """Crea un socket TCP ja connectat, amb bind a la IP/port locals indicats."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(local_addr)
+    sock.connect((server_ip, server_port))
+    return sock
 
-async def send_heartbeat(server_ip: str, server_port: int, my_ip: str, local_port: int):
+def send_heartbeat(server_ip: str, server_port: int, my_ip: str, local_port: int, status_queue: StatusQueue):
     uri = f"ws://{server_ip}:{server_port}"
-
     while True:
         try:
-            async with websockets.connect(
-                uri, local_addr=(my_ip, local_port)
-            ) as ws:
-                await ws.send(my_ip)
+            sock = _connected_socket(server_ip, server_port, (my_ip, local_port))
+            with connect(uri, sock=sock) as ws:
+                ws.send(my_ip)
                 print(f"He enviat missatge amb IP {my_ip}")
                 try:
-                    await asyncio.wait_for(ws.recv(), timeout=CONFIRM_TIMEOUT)
-                    print("He rebut confirmacio")
-                except asyncio.TimeoutError:
-                    print("No he rebut confirmacio en 10 segons")
-        except OSError as e:
+                    raw = ws.recv(timeout=CONFIRM_TIMEOUT)
+                    data = json.loads(raw)
+                    status_queue.put(data)
+                    print(f"He rebut confirmacio: client={data['client']} status={data['status']}")
+                except TimeoutError:
+                    print(f"No he rebut confirmacio en {CONFIRM_TIMEOUT} segons")
+        except (OSError, ConnectionClosed, websockets.exceptions.InvalidHandshake) as e:
             print(f"No s'ha pogut connectar al servidor ({e})")
-
-        await asyncio.sleep(RETRY_INTERVAL)
+        time.sleep(RETRY_INTERVAL)
 
 
 if __name__ == "__main__":
@@ -64,12 +98,15 @@ if __name__ == "__main__":
     parser.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT)
     parser.add_argument("--local-port", type=int, default=CLIENT_PORT)
     parser.add_argument("--iface", default=IFACE, help="Interficie de xarxa (per defecte enp2s0)")
-    parser.add_argument("--my-ip", default=None, help="IP propia (per defecte, autodetectada de --iface)")
+    parser.add_argument("--my-ip", default=None, help="IP propia (per defecte, autodetectada de la interficie)")
     args = parser.parse_args()
 
     my_ip = args.my_ip or detect_own_ip(args.iface)
 
+    status_queue = StatusQueue()
+    threading.Thread(target=status_reader_loop, args=(status_queue,), daemon=True).start()
+
     try:
-        asyncio.run(send_heartbeat(args.server_ip, args.server_port, my_ip, args.local_port))
+         send_heartbeat(args.server_ip, args.server_port, my_ip, args.local_port, status_queue)
     except KeyboardInterrupt:
         print("\nClient aturat (CTRL+C)")
