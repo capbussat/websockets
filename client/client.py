@@ -5,7 +5,10 @@ Envia periodicament la propia IP al servidor i n'espera confirmacio.
 """
 import asyncio
 import argparse
+import re
 import socket
+import subprocess
+import sys
 
 import websockets
 
@@ -14,18 +17,24 @@ DEFAULT_SERVER_PORT = 8765
 CLIENT_PORT = 8766      # port local del client (bind d'origen)
 CONFIRM_TIMEOUT = 3    # segons d'espera per la confirmacio
 RETRY_INTERVAL = 20     # segons entre enviaments
+IFACE = "enp2s0"        # interficie de xarxa a consultar
 
 
-def detect_own_ip() -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def detect_own_ip(iface: str = IFACE) -> str:
+    """Obté la IPv4 de la interfície indicada mitjançant 'ip addr'."""
     try:
-        s.connect(("8.8.8.8", 80))
-        print (s.getsockname()[0])
-        return "1.2.3.10"
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+        sortida = subprocess.run(
+            ["ip", "-4", "-oneline", "addr", "show", "dev", iface],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        sys.exit(f"No s'ha pogut consultar la interficie {iface}: {e}")
+
+    match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", sortida)
+    if not match:
+        sys.exit(f"La interficie {iface} no té IPv4 assignada")
+
+    return match.group(1)
 
 
 async def send_heartbeat(server_ip: str, server_port: int, my_ip: str, local_port: int):
@@ -54,10 +63,11 @@ if __name__ == "__main__":
     parser.add_argument("--server-ip", default=DEFAULT_SERVER_IP)
     parser.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT)
     parser.add_argument("--local-port", type=int, default=CLIENT_PORT)
-    parser.add_argument("--my-ip", default=None, help="IP propia (per defecte, autodetectada)")
+    parser.add_argument("--iface", default=IFACE, help="Interficie de xarxa (per defecte enp2s0)")
+    parser.add_argument("--my-ip", default=None, help="IP propia (per defecte, autodetectada de --iface)")
     args = parser.parse_args()
 
-    my_ip = args.my_ip or detect_own_ip()
+    my_ip = args.my_ip or detect_own_ip(args.iface)
 
     try:
         asyncio.run(send_heartbeat(args.server_ip, args.server_port, my_ip, args.local_port))
